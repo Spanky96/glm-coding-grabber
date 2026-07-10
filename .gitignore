@@ -2,3 +2,7 @@
 ._*
 Thumbs.db
 www.bigmodel.cn/
+index-v-*.js
+CLAUDE.md
+__pycache__
+captcha/proxy_api.txt

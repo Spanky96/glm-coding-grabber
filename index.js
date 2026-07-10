@@ -572,8 +572,6 @@ var BUY_TIME_DEFAULT = '09:59:59';
 var buyBtnIndex = 2;
 // 套餐类型：'month'=月, 'quarter'=季, 'year'=年
 var PACKAGE_TYPE_DEFAULT = 'quarter';
-// 邀请码（自动替换URL中的ic参数）
-var INVITATION_CODE = 'XYXVH4BD28';
 
 // ── 验证码识别：仅支持本地 ddddocr HTTP 服务（~100ms） ──
 
@@ -641,7 +639,7 @@ function startConnectionPreheat() {
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/biz/pay/batch-preview');
         xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.send(JSON.stringify({ invitationCode: getQueryString('ic') || INVITATION_CODE }));
+        xhr.send(JSON.stringify({}));
     }, 2000);
 }
 
@@ -1127,8 +1125,7 @@ function showHelpDialog() {
                 <span class="help-highlight">自动锁单</span>（左上角黄色复选框）：勾选后，preview成功时会直接调create-sign接口锁单，跳过扫码→pay-middle-page的延迟。锁单成功后弹出支付宝支付二维码，扫码即可直接订阅，无需担心售罄。
             </div>
             <div class="help-close">
-                <p style="color:#409eff;margin-bottom:4px;">QQ交流群: <strong>981656846</strong></p>
-                <p style="color:#e6a23c;font-size:12px;margin-bottom:12px;">支持作者 👉 <a href="https://www.bigmodel.cn/glm-coding?ic=XYXVH4BD28" target="_blank" style="color:#409eff;">用邀请链接购买享5%优惠</a></p>
+                <p style="color:#409eff;margin-bottom:12px;">QQ交流群: <strong>981656846</strong></p>
                 <button id="help-close-btn">我知道了</button>
             </div>
         </div>
@@ -1951,13 +1948,11 @@ function tryLockOrder() {
         return;
     }
 
-    var invitationCode = getQueryString('ic') || INVITATION_CODE;
     var payload = JSON.stringify({
         payType: 'ALI',
         productId: priceData.productId,
         customerId: customerId,
-        bizId: priceData.bizId,
-        invitationCode: invitationCode
+        bizId: priceData.bizId
     });
 
     console.log('[锁单] 发起create-sign, productId:', priceData.productId, 'bizId:', priceData.bizId);
@@ -2280,8 +2275,6 @@ function scheduleNext() {
 // ==================== 启动 ====================
 function init() {
     if (inCaptchaFrame) return;
-    // 检查并修正邀请码
-    checkAndFixInvitationCode();
 
     // 安装 API 拦截器（拦截 /biz/pay/preview 响应）
     setupAPIInterceptor();
@@ -2293,21 +2286,6 @@ function init() {
     scheduleNext();
     // 延迟检查页面高度
     setTimeout(checkPageHeight, 100);
-}
-
-// 检查并修正邀请码（确保URL中有正确的ic参数）
-function checkAndFixInvitationCode() {
-    // 只在 /glm-coding 页面处理
-    if (location.pathname !== '/glm-coding') return;
-
-    var currentIc = getQueryString('ic');
-    if (currentIc !== INVITATION_CODE) {
-        // 构建新的URL
-        var url = new URL(location.href);
-        url.searchParams.set('ic', INVITATION_CODE);
-        console.log('[自动抢购] 邀请码不正确，自动替换: ' + currentIc + ' → ' + INVITATION_CODE);
-        location.replace(url.toString());
-    }
 }
 
 // 检查页面高度是否足够显示二维码（最低900px）
