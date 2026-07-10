@@ -1,0 +1,21 @@
+# ── 代理 API 提取地址配置 ──────────────────────────────────────────
+# 把代理供应商的「提取链接」整行填到「proxy_api.txt」里（本文件是模板，不会生效）。
+#
+# ① 复制本文件为 proxy_api.txt：
+#      cp captcha/proxy_api.example.txt captcha/proxy_api.txt
+# ② 在 proxy_api.txt 中取消某条链接前的注释（#）并填入你的 token。
+#
+# proxy_api.txt 已被 .gitignore 忽略，token 不会进 git。
+# 也可改用环境变量 PROXY_API_URL（优先级高于文件）：
+#      export PROXY_API_URL='http://proxy.siyetian.com/apis_get.html?token=...&limit=1&type=0&split=1&split_text='
+#
+# ── 司叶天示例（替换 YOUR_TOKEN）──────────────────────────────────
+# 注意：limit 不要超过账号「单次提取上限」，否则 API 返回「单次提取数量过多」。
+#   limit=200 常被拒 → 先用 limit=1 试通，再按账号实际上限调大。
+# http://proxy.siyetian.com/apis_get.html?token=YOUR_TOKEN&limit=1&type=0&time=&split=1&split_text=
+#
+# ── 行为说明 ──────────────────────────────────────────────────────
+#  - 返回纯文本、每行一个 ip:port（HTTP 代理）；启动时并发健康检查，仅留延迟达标的进快窗口。
+#  - 裸 ip:port 默认按 http 协议处理；如需 socks5 等设环境变量 PROXY_API_SCHEME。
+#  - 代理为短生命周期，每 PROXY_REFRESH_SECONDS（默认 120s）重新提取 + 健康检查。
+#  - proxy_api.txt 为空、且未设 PROXY_API_URL 时，自动回退到 proxies.txt。

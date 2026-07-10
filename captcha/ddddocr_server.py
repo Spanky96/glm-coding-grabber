@@ -32,6 +32,183 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 log = logging.getLogger('ddddocr-server')
 
+# ── 代理池（可选：缺依赖或空 proxies.txt 时自动禁用，不影响 OCR） ──
+import os as _os
+try:
+    import proxy_forwarder
+    from proxy_pool import ProxyPool
+    _PROXY_DEPS_OK = True
+except Exception as _e:
+    _PROXY_DEPS_OK = False
+    proxy_forwarder = None
+    ProxyPool = None
+    log.warning('代理模块加载失败，代理功能禁用（OCR 不受影响）: %s', _e)
+
+_PROXY_POOL = None
+_PROXY_ENABLED = False
+_PROXY_SOURCE = 'none'   # 'api' | 'file' | 'none'（/health 暴露，便于前端/排查）
+_PROXY_API_URL = None     # API 模式下保存提取链接，preview 后可立即重拉新代理
+_PROXY_API_SCHEME = 'http'
+_PROXY_ROTATE_LOCK = None
+_CAPTCHA_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_PROXIES_FILE = _os.path.join(_CAPTCHA_DIR, 'proxies.txt')
+_PROXY_API_FILE = _os.path.join(_CAPTCHA_DIR, 'proxy_api.txt')
+
+
+def _read_api_url():
+    """读代理 API 提取地址：环境变量 PROXY_API_URL 优先，其次 proxy_api.txt 首条非注释行。都无返回 None。"""
+    url = _os.environ.get('PROXY_API_URL', '').strip()
+    if url:
+        return url
+    if _os.path.exists(_PROXY_API_FILE):
+        try:
+            with open(_PROXY_API_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    s = line.strip()
+                    if s and not s.startswith('#'):
+                        return s
+        except Exception as e:
+            log.warning('读取 proxy_api.txt 失败: %s', e)
+    return None
+
+
+def _init_proxy():
+    """启动时加载代理并健康检查：API（若配置）优先，回退 proxies.txt。不可用则禁用（OCR 照常运行）。"""
+    global _PROXY_POOL, _PROXY_ENABLED, _PROXY_SOURCE, _PROXY_API_URL, _PROXY_API_SCHEME, _PROXY_ROTATE_LOCK
+    if not _PROXY_DEPS_OK or proxy_forwarder is None or ProxyPool is None:
+        return
+    if not proxy_forwarder.is_available():
+        log.warning('代理后端未安装（需 curl-cffi 或 httpx），代理功能禁用')
+        return
+
+    api_url = _read_api_url()
+    api_scheme = (_os.environ.get('PROXY_API_SCHEME', 'http').strip().lower() or 'http')
+    pool = ProxyPool()
+
+    n, source = 0, 'none'
+    if api_url:
+        n = pool.load_from_api(api_url, scheme=api_scheme)
+        source = 'api' if n > 0 else 'none'
+        if n == 0:
+            log.warning('API 提取失败/为空，回退到 proxies.txt: %s', _PROXIES_FILE)
+    if n == 0:
+        n = pool.load_from_file(_PROXIES_FILE)
+        source = 'file' if n > 0 else 'none'
+    if n == 0:
+        log.warning('无代理来源（API 与 proxies.txt 均为空），代理功能禁用（OCR 不受影响）')
+        return
+
+    log.info('加载 %d 个代理（来源 %s），开始健康检查（目标 %s）...', n, source, pool.health_target)
+    healthy = pool.health_check_all()
+    if healthy == 0:
+        log.warning('健康检查后无可用代理，代理功能禁用')
+        return
+    _PROXY_POOL = pool
+    _PROXY_ENABLED = True
+    _PROXY_SOURCE = source
+    _PROXY_API_URL = api_url if source == 'api' else None
+    _PROXY_API_SCHEME = api_scheme
+    log.info('代理池就绪：%d 个可用代理，来源 %s，后端 %s', healthy, source, proxy_forwarder.backend())
+
+    # API 代理短命 → 刷新需重新提取；纯文件模式仅重新健康检查。仅当 init 真正用 API 时才在刷新里重提取，
+    # 否则（已回退文件）不反复打一个持续失败的 API。
+    interval = int(_os.environ.get('PROXY_REFRESH_SECONDS', '120' if source == 'api' else '300'))
+    refresh_api_url = api_url if source == 'api' else None
+    import threading
+    _PROXY_ROTATE_LOCK = threading.Lock()
+    threading.Thread(target=_refresh_loop,
+                     args=(pool, refresh_api_url, api_scheme, interval), daemon=True).start()
+
+
+def _refresh_loop(pool, api_url, scheme, interval):
+    """后台定期刷新代理池：配了 API 则重新提取（短命代理），再统一健康检查。失败保留旧池。"""
+    while True:
+        time.sleep(interval)
+        try:
+            # API 提取会替换整个池，需与 preview 后立即轮换串行化，避免互相覆盖。
+            lock = _PROXY_ROTATE_LOCK
+            if lock is None:
+                if api_url:
+                    got = pool.load_from_api(api_url, scheme=scheme)
+                    if got == 0:
+                        log.warning('刷新：API 提取失败/为空，保留旧池并重新健康检查')
+                pool.health_check_all()
+            else:
+                with lock:
+                    if api_url:
+                        got = pool.load_from_api(api_url, scheme=scheme)
+                        if got == 0:
+                            log.warning('刷新：API 提取失败/为空，保留旧池并重新健康检查')
+                    pool.health_check_all()
+        except Exception as e:
+            log.warning('代理池刷新失败: %s', e)
+
+
+def _short(url, n=80):
+    return url if len(url) <= n else url[:n] + '...'
+
+
+def _filter_resp_headers(h):
+    """剥离 hop-by-hop / 已由后端解压的头，避免前端二次处理。"""
+    drop = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+    return {k: v for k, v in (h or {}).items() if k.lower() not in drop}
+
+
+def _is_preview_url(url):
+    return bool(url and '/api/biz/pay/preview' in url)
+
+
+def _discard_used_proxy(session_id, proxy_raw, via_label):
+    """用完即弃：释放 session 粘性，永久移除该代理。
+    在 API 模式下异步补货（不阻塞当前响应）；文件模式下仅冷却（池有限，不能丢弃）。"""
+    if _PROXY_POOL is None:
+        return
+    try:
+        _PROXY_POOL.release_session(session_id)
+    except Exception:
+        pass
+    if proxy_raw is None:
+        return
+
+    is_api = (_PROXY_SOURCE == 'api' and bool(_PROXY_API_URL))
+    if is_api:
+        # API 代理短命，用完即弃 + 异步补货
+        _PROXY_POOL.discard(proxy_raw)
+        import threading
+        threading.Thread(
+            target=_safe_refill, args=(_PROXY_API_URL, _PROXY_API_SCHEME),
+            daemon=True
+        ).start()
+        log.info('代理已丢弃: %s，后台补货中...', via_label)
+    else:
+        # 文件模式：仅冷却（池有限不能丢弃），等冷却结束复用
+        # 找到对应 UpstreamProxy 对象来 mark_failure
+        try:
+            with _PROXY_POOL._lock:
+                target = next((p for p in _PROXY_POOL._proxies if p.raw == proxy_raw), None)
+            if target:
+                _PROXY_POOL.mark_failure(target)
+        except Exception:
+            pass
+
+    try:
+        proxy_forwarder.reset_cookies()
+    except Exception:
+        pass
+
+
+def _safe_refill(api_url, scheme):
+    """带锁的异步补货，与后台定时刷新互斥。"""
+    lock = _PROXY_ROTATE_LOCK
+    try:
+        if lock:
+            with lock:
+                _PROXY_POOL.refill_from_api(api_url, scheme=scheme)
+        else:
+            _PROXY_POOL.refill_from_api(api_url, scheme=scheme)
+    except Exception as e:
+        log.warning('异步补货失败: %s', e)
+
 # ── 模型 ──────────────────────────────────────────────────────────
 log.info('正在加载 ddddocr 模型...')
 _det = ddddocr.DdddOcr(det=True, ocr=False, show_ad=False)
@@ -170,7 +347,7 @@ def _render_variants(char):
                 variants.append(_to_hog(arr.flatten()))
 
     _variant_cache[char] = variants
-    log.info(f'渲染 "{char}": {len(variants)} 个变体')
+    # log.info(f'渲染 "{char}": {len(variants)} 个变体')
     return variants
 
 
@@ -295,8 +472,8 @@ def solve_click_captcha(img_bytes: bytes, prompt: str) -> list[dict]:
         })
 
     ocr_summary = [f'{d["char"]}({d["confidence"]:.0%})' for d in detected]
-    log.info(f'检测到 {len(detected)} 个目标: {ocr_summary}')
-    log.info(f'提示字符: {list(prompt)}, 最小距离: {min_dist:.0f}px')
+    #log.info(f'检测到 {len(detected)} 个目标: {ocr_summary}')
+    #log.info(f'提示字符: {list(prompt)}, 最小距离: {min_dist:.0f}px')
 
     # ── 3. 渲染提示字变体 ──
     prompt_vars = {}
@@ -327,7 +504,7 @@ def solve_click_captcha(img_bytes: bytes, prompt: str) -> list[dict]:
     # 打印评分矩阵
     for pi in range(n):
         row = ', '.join(f'{score[pi][di]:.2f}' for di in range(m))
-        log.info(f'评分[{prompt[pi]}]: [{row}]')
+        # log.info(f'评分[{prompt[pi]}]: [{row}]')
 
     # ── 5. 全排列搜索（找总分最高的合法分配） ──
     best_total = -float('inf')
@@ -366,11 +543,11 @@ def solve_click_captcha(img_bytes: bytes, prompt: str) -> list[dict]:
         di = best_perm[i]
         d = detected[di]
         result.append({'x': round(d['x'], 1), 'y': round(d['y'], 1)})
-        log.info(
-            f'  "{prompt[i]}" → 检测[{di}] '
-            f'(OCR="{d["char"]}" {d["confidence"]:.0%}, '
-            f'score={score[i][di]:.3f})'
-        )
+        # log.info(
+        #     f'  "{prompt[i]}" → 检测[{di}] '
+        #     f'(OCR="{d["char"]}" {d["confidence"]:.0%}, '
+        #     f'score={score[i][di]:.3f})'
+        # )
 
     return result
 
@@ -405,9 +582,111 @@ def click():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
+@app.route('/proxy', methods=['POST'])
+def proxy_forward_route():
+    """通用转发：请求始终经后端发出。有代理池→走代理出口；无代理池→后端直连转发。
+    body: {method, url, headers, body, session}（session 用于出口粘性）。
+
+    代理生命周期：每次「验证码+preview」组合结束后，该代理即被丢弃：
+      - API 模式：永久移除 + 异步补货新 IP
+      - 文件模式：冷却 60s 后复用（池有限不能丢弃）
+    """
+    if not proxy_forwarder or not proxy_forwarder.is_available():
+        return jsonify({'success': False, 'error': '后端转发库未安装（curl-cffi/httpx）'}), 503
+    try:
+        data = request.get_json(force=True)
+        method = (data.get('method') or 'GET').upper()
+        url = data.get('url')
+        headers = data.get('headers') or {}
+        body = data.get('body')
+        session_id = data.get('session')
+        rotate_after = bool(data.get('rotate_after')) or _is_preview_url(url)
+        if not url:
+            return jsonify({'success': False, 'error': '缺少 url'}), 400
+
+        # 有代理池且非空 → 选代理；否则 None（后端用 curl_cffi/httpx 直连转发）
+        proxy = None
+        if _PROXY_ENABLED and _PROXY_POOL is not None:
+            try:
+                proxy = _PROXY_POOL.get(session_id)
+            except Exception:
+                proxy = None
+        proxy_url = proxy.proxy_url if proxy else None
+        via = proxy.address if proxy else 'direct'
+
+        t0 = time.time()
+        try:
+            status, resp_headers, resp_body = proxy_forwarder.request(
+                method, url, headers=headers, body=body,
+                proxy_url=proxy_url, timeout=12.0
+            )
+        except Exception as e:
+            log.warning('转发失败 (%s): %s', via, e)
+            if proxy is not None and _PROXY_POOL is not None:
+                _discard_used_proxy(session_id, proxy.raw, via)
+            return jsonify({'success': False, 'error': '转发失败: %s' % e, 'proxy': via}), 502
+
+        elapsed = int((time.time() - t0) * 1000)
+        log.info('转发 %s %s → %d (%dms) via %s', method, _short(url), status, elapsed, via)
+        rotated = False
+        if rotate_after and proxy is not None:
+            _discard_used_proxy(session_id, proxy.raw, via)
+            rotated = True
+        return jsonify({
+            'success': status < 500,
+            'status': status,
+            'headers': _filter_resp_headers(resp_headers),
+            'body': base64.b64encode(resp_body).decode('ascii'),
+            'proxy': via,
+            'rotated': rotated,
+        })
+    except Exception as e:
+        log.error('转发异常: %s', e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/proxy/discard', methods=['POST'])
+def discard_proxy_route():
+    """JS 端在 proxyViaLocal 超时/网络错误时调用，确保当前 session 绑定的代理被丢弃。
+    body: {session} — 与 /proxy 转发同款的 session 标识。"""
+    if not _PROXY_ENABLED or _PROXY_POOL is None:
+        return jsonify({'success': False, 'error': '代理池未启用'}), 503
+    try:
+        data = request.get_json(force=True)
+        session_id = data.get('session')
+        if not session_id:
+            return jsonify({'success': False, 'error': '缺少 session'}), 400
+        # 找到该 session 绑定的 proxy raw 并丢弃
+        with _PROXY_POOL._lock:
+            bound_raw = _PROXY_POOL._session.get(session_id)
+        if bound_raw:
+            _discard_used_proxy(session_id, bound_raw, bound_raw)
+            return jsonify({'success': True, 'discarded': bound_raw})
+        else:
+            _PROXY_POOL.release_session(session_id)
+            return jsonify({'success': True, 'discarded': None, 'note': 'session 未绑定代理'})
+    except Exception as e:
+        log.error('discard 异常: %s', e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'engine': 'ddddocr', 'fonts': len(_all_font_paths)})
+    backend_ok = proxy_forwarder is not None and proxy_forwarder.is_available()
+    proxy_info = {
+        'enabled': backend_ok,         # 后端具备转发能力（与是否有代理无关）
+        'ready': backend_ok,           # 前端据此判断能否走 /proxy
+        'has_proxies': bool(_PROXY_ENABLED and _PROXY_POOL is not None),
+        'source': _PROXY_SOURCE,       # 'api' | 'file' | 'none'：代理来源，便于排查
+    }
+    if proxy_forwarder is not None:
+        proxy_info['backend'] = proxy_forwarder.backend()
+    if _PROXY_ENABLED and _PROXY_POOL is not None:
+        proxy_info.update(_PROXY_POOL.stats())
+    return jsonify({
+        'status': 'ok', 'engine': 'ddddocr', 'fonts': len(_all_font_paths),
+        'proxy': proxy_info,
+    })
 
 
 if __name__ == '__main__':
@@ -419,5 +698,6 @@ if __name__ == '__main__':
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
-    log.info(f'启动: http://{args.host}:{args.port} ({len(_all_font_paths)} 个中文字体)')
+    _init_proxy()  # 加载并健康检查代理池（缺失则自动禁用，不影响 OCR）
+    log.info(f'启动: http://{args.host}:{args.port} ({len(_all_font_paths)} 个中文字体, 代理={"on" if _PROXY_ENABLED else "off"})')
     app.run(host=args.host, port=args.port, debug=args.debug)

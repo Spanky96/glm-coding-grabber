@@ -1,3 +1,6 @@
 ddddocr>=1.5.0
 flask>=3.0
 Pillow>=10.0
+# 代理转发：优先 curl-cffi（模拟浏览器 TLS/JA3 指纹，对腾讯验证码/智谱风控友好），回退 httpx
+curl-cffi>=0.7.0
+httpx[socks]>=0.27.0

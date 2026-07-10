@@ -1,0 +1,23 @@
+# 代理池配置 —— 每行一个代理，支持以下格式：
+#   socks5://user:pass@ip:port      （推荐：腾讯验证码/智谱对 socks5 出口较友好）
+#   socks5://ip:port
+#   http://ip:port
+#   http://user:pass@ip:port
+#   ip:port                         （裸地址默认按 socks5 处理）
+#
+# 以 # 开头为注释，空行忽略。重复行自动去重。
+#
+# 启动 ddddocr_server.py 时会并发对所有代理做健康检查（测「经该代理访问
+# bigmodel.cn 的延迟」），仅保留延迟达标的前若干个进入「快窗口」轮询，
+# 失败的代理冷却 60s 自动跳过，每 5 分钟后台刷新一次池子。
+#
+# 当未安装 curl-cffi/httpx，或本文件为空/无可用代理时，/health 的
+# proxy.ready=false，index-v3 会提示「脚本启动失败」。
+#
+# 👉 请在下面填入你自己的代理（示例已注释，不会生效）：
+# socks5://username:password@1.2.3.4:1080
+# http://10.0.0.5:8080
+#
+# 💡 也可改用「API 自动提取」（无需手动维护本文件）：
+#    复制 proxy_api.example.txt 为 proxy_api.txt 并填入提取链接，或设环境变量
+#    PROXY_API_URL。配置后优先级高于本文件；为空时自动回退到本文件。
